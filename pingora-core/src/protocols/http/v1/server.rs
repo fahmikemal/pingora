@@ -654,24 +654,37 @@ impl HttpSession {
 
     /// Write the response header to the client.
     /// This function can be called more than once to send 1xx informational headers excluding 101.
-    pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
+    pub async fn write_response_header(&mut self, header: Box<ResponseHeader>) -> Result<()> {
+        self.write_response_header_flushing(header, true)
+            .await
+            .map(|_| ())
+    }
+
+    /// [Self::write_response_header()], but with `flush` false a flush the header calls for is
+    /// left to the caller, which gets `true` back to do it.
+    async fn write_response_header_flushing(
+        &mut self,
+        mut header: Box<ResponseHeader>,
+        flush: bool,
+    ) -> Result<bool> {
         // Prepare header (handle upgrades, set headers, initialize body writer, serialize to bytes)
-        let Some((write_buf, flush)) = self.prepare_response_header(&mut header)? else {
+        let Some((write_buf, wants_flush)) = self.prepare_response_header(&mut header)? else {
             // Header already sent or should be ignored
-            return Ok(());
+            return Ok(false);
         };
 
         match self.underlying_stream.write_all(&write_buf).await {
             Ok(()) => {
                 // flush the stream if 1xx header or there is no response body
-                if flush || self.body_writer.finished() {
+                let wants_flush = wants_flush || self.body_writer.finished();
+                if wants_flush && flush {
                     self.underlying_stream
                         .flush()
                         .await
                         .or_err(WriteError, "flushing response header")?;
                 }
                 self.response_written = Some(header);
-                Ok(())
+                Ok(wants_flush && !flush)
             }
             Err(e) => Error::e_because(WriteError, "writing response header", e),
         }
@@ -1040,7 +1053,7 @@ impl HttpSession {
         self.body_reader.take_body_overread()
     }
 
-    async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
+    async fn do_write_body_buf(&mut self, flush: bool) -> Result<Option<usize>> {
         // Don't flush empty chunks, they are considered end of body for chunks
         if self.body_write_buf.is_empty() {
             return Ok(None);
@@ -1048,7 +1061,7 @@ impl HttpSession {
 
         let written = self
             .body_writer
-            .write_body(&mut self.underlying_stream, &self.body_write_buf)
+            .write_body_flushing(&mut self.underlying_stream, &self.body_write_buf, flush)
             .await;
 
         if let Ok(Some(num_bytes)) = written {
@@ -1063,11 +1076,11 @@ impl HttpSession {
 
     async fn write_body_buf(&mut self) -> Result<Option<usize>> {
         match self.write_timeout(self.body_write_buf.len()) {
-            Some(t) => match timeout(t, self.do_write_body_buf()).await {
+            Some(t) => match timeout(t, self.do_write_body_buf(true)).await {
                 Ok(res) => res,
                 Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
             },
-            None => self.do_write_body_buf().await,
+            None => self.do_write_body_buf(true).await,
         }
     }
 
@@ -1557,11 +1570,16 @@ impl HttpSession {
             return self.response_duplex(tasks.pop().unwrap()).await;
         }
 
+        // The tasks are written with one flush at the end rather than one per task: a header
+        // without Content-Length, each chunk and the last chunk would otherwise each go out in a
+        // segment of their own.
         let mut end_stream = false;
+        let mut flush_header = false;
         for task in tasks.into_iter() {
             end_stream = match task {
                 HttpTask::Header(header, end_stream) => {
-                    self.write_response_header(header)
+                    flush_header |= self
+                        .write_response_header_flushing(header, false)
                         .await
                         .map_err(|e| e.into_down())?;
                     end_stream
@@ -1587,10 +1605,34 @@ impl HttpSession {
                 }
             }
         }
-        self.write_body_buf().await.map_err(|e| e.into_down())?;
         if end_stream {
-            // no-op if body wasn't initialized or is finished already
-            self.finish_body().await.map_err(|e| e.into_down())?;
+            // The body, the last chunk and the flush under the timeout of writing the body.
+            let write_timeout = self.write_timeout(self.body_write_buf.len());
+            let finish = async {
+                self.do_write_body_buf(false).await?;
+                // no-op if body wasn't initialized or is finished already
+                self.finish_body().await
+            };
+            match write_timeout {
+                Some(t) => match timeout(t, finish).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}"))
+                    }
+                },
+                None => finish.await,
+            }
+            .map_err(|e| e.into_down())?;
+        } else {
+            self.write_body_buf().await.map_err(|e| e.into_down())?;
+            if flush_header {
+                // a no-op if writing the body flushed already
+                self.underlying_stream
+                    .flush()
+                    .await
+                    .or_err(WriteError, "flushing response header")
+                    .map_err(|e| e.into_down())?;
+            }
         }
         Ok(end_stream || self.body_writer.finished())
     }
@@ -3670,6 +3712,79 @@ mod test_proxy_tasks {
              (body_writer.finished() is true). Got flush_before={flush_before}, \
              flush_after={flush_after}"
         );
+    }
+
+    /// Writes `tasks` with response_duplex_vec() to a GET, returning end_stream and the number
+    /// of flushes; `wire` is the whole response expected.
+    async fn duplex_vec_flushes(tasks: Vec<HttpTask>, wire: &[u8]) -> (bool, usize) {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mock_io = Builder::new().read(request).write(wire).build();
+        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+        let mut http_stream = HttpSession::new(Box::new(flush_mock));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let end_stream = http_stream.response_duplex_vec(tasks).await.unwrap();
+        (end_stream, FlushTrackingMock::flush_count(&flush_count))
+    }
+
+    fn chunked_header() -> Box<ResponseHeader> {
+        let mut header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        header
+            .insert_header("Transfer-Encoding", "chunked")
+            .unwrap();
+        Box::new(header)
+    }
+
+    #[tokio::test]
+    async fn test_duplex_vec_flushes_a_whole_chunked_response_once() {
+        init_log();
+        // The header, the chunk and the last chunk would otherwise be flushed one by one.
+        let tasks = vec![
+            HttpTask::Header(chunked_header(), false),
+            HttpTask::Body(Some(Bytes::from("hello")), true),
+        ];
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(duplex_vec_flushes(tasks, wire).await, (true, 1));
+    }
+
+    #[tokio::test]
+    async fn test_duplex_vec_flushes_a_whole_sized_response_once() {
+        init_log();
+        let mut header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        header.insert_header("Content-Length", "5").unwrap();
+        let tasks = vec![
+            HttpTask::Header(Box::new(header), false),
+            HttpTask::Body(Some(Bytes::from("hello")), false),
+            HttpTask::Done,
+        ];
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(duplex_vec_flushes(tasks, wire).await, (true, 1));
+    }
+
+    #[tokio::test]
+    async fn test_duplex_vec_flushes_a_streamed_header_without_body() {
+        init_log();
+        // No body yet: the header must still go out at once, e.g. for server-sent events.
+        let tasks = vec![
+            HttpTask::Header(chunked_header(), false),
+            HttpTask::Body(None, false),
+        ];
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(duplex_vec_flushes(tasks, wire).await, (false, 1));
+    }
+
+    #[tokio::test]
+    async fn test_duplex_vec_flushes_a_streamed_chunk_with_its_header() {
+        init_log();
+        let tasks = vec![
+            HttpTask::Header(chunked_header(), false),
+            HttpTask::Body(Some(Bytes::from("hello")), false),
+        ];
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        let (end_stream, flushes) = duplex_vec_flushes(tasks, wire).await;
+        assert!(!end_stream);
+        // the chunk's flush, then the header's, which finds nothing left to send
+        assert_eq!(flushes, 2);
     }
 
     #[tokio::test]

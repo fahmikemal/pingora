@@ -1322,12 +1322,27 @@ impl BodyWriter {
     where
         S: AsyncWrite + Unpin + Send,
     {
+        self.write_body_flushing(stream, buf, true).await
+    }
+
+    /// Like [Self::write_body()], but `flush` false leaves flushing `stream` to the caller,
+    /// e.g. to [Self::finish()] and a flush right after it, so that the rest of a body and its
+    /// end go out together.
+    pub(crate) async fn write_body_flushing<S>(
+        &mut self,
+        stream: &mut S,
+        buf: &[u8],
+        flush: bool,
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
         trace!("Writing Body, size: {}", buf.len());
         match self.body_mode {
             BM::Complete(_) => Ok(None),
-            BM::ContentLength(_, _) => self.do_write_body(stream, buf).await,
-            BM::ChunkedEncoding(_) => self.do_write_chunked_body(stream, buf).await,
-            BM::UntilClose(_) => self.do_write_until_close_body(stream, buf).await,
+            BM::ContentLength(_, _) => self.do_write_body(stream, buf, flush).await,
+            BM::ChunkedEncoding(_) => self.do_write_chunked_body(stream, buf, flush).await,
+            BM::UntilClose(_) => self.do_write_until_close_body(stream, buf, flush).await,
             BM::ToSelect => Ok(None), // Error here?
         }
     }
@@ -1344,7 +1359,12 @@ impl BodyWriter {
         matches!(self.body_mode, BM::UntilClose(_))
     }
 
-    async fn do_write_body<S>(&mut self, stream: &mut S, buf: &[u8]) -> Result<Option<usize>>
+    async fn do_write_body<S>(
+        &mut self,
+        stream: &mut S,
+        buf: &[u8],
+        flush: bool,
+    ) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
     {
@@ -1364,7 +1384,7 @@ impl BodyWriter {
                 match res {
                     Ok(()) => {
                         self.body_mode = BM::ContentLength(total, written + to_write);
-                        if self.finished() {
+                        if flush && self.finished() {
                             stream.flush().await.or_err(WriteError, "flushing body")?;
                         }
                         Ok(Some(to_write))
@@ -1380,6 +1400,7 @@ impl BodyWriter {
         &mut self,
         stream: &mut S,
         buf: &[u8],
+        flush: bool,
     ) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
@@ -1394,7 +1415,9 @@ impl BodyWriter {
                     .write_all_buf(&mut output_buf)
                     .await
                     .or_err(WriteError, "while writing body")?;
-                stream.flush().await.or_err(WriteError, "flushing body")?;
+                if flush {
+                    stream.flush().await.or_err(WriteError, "flushing body")?;
+                }
                 self.body_mode = BM::ChunkedEncoding(written + chunk_size);
                 Ok(Some(chunk_size))
             }
@@ -1406,6 +1429,7 @@ impl BodyWriter {
         &mut self,
         stream: &mut S,
         buf: &[u8],
+        flush: bool,
     ) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
@@ -1416,7 +1440,9 @@ impl BodyWriter {
                 match res {
                     Ok(()) => {
                         self.body_mode = BM::UntilClose(written + buf.len());
-                        stream.flush().await.or_err(WriteError, "flushing body")?;
+                        if flush {
+                            stream.flush().await.or_err(WriteError, "flushing body")?;
+                        }
                         Ok(Some(buf.len()))
                     }
                     Err(e) => Error::e_because(WriteError, "while writing body", e),
