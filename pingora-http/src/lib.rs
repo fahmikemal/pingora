@@ -45,6 +45,9 @@ mod case_header_name;
 use case_header_name::CaseHeaderName;
 pub use case_header_name::{CasedHeaderName, IntoCaseHeaderName};
 
+mod name_case;
+use name_case::NameCase;
+
 pub mod prelude {
     pub use crate::RequestHeader;
     pub use crate::ResponseHeader;
@@ -84,7 +87,7 @@ pub enum HeaderNameVariant<'a> {
 #[derive(Debug)]
 pub struct RequestHeader {
     base: ReqParts,
-    header_name_map: Option<CaseMap>,
+    name_case: NameCase,
     raw_target: RawTarget,
     // whether we send END_STREAM with HEADERS for h2 requests
     send_end_stream: bool,
@@ -152,7 +155,7 @@ impl RequestHeader {
         base.headers.reserve(http_header_map_upper_bound(size_hint));
         RequestHeader {
             base,
-            header_name_map: None,
+            name_case: NameCase::Off,
             raw_target: RawTarget::FromUri,
             send_end_stream: true,
         }
@@ -167,9 +170,7 @@ impl RequestHeader {
         size_hint: Option<usize>,
     ) -> Result<Self> {
         let mut req = Self::build_no_case(method, path, size_hint)?;
-        req.header_name_map = Some(CaseMap::with_capacity(http_header_map_upper_bound(
-            size_hint,
-        )));
+        req.name_case = NameCase::preserved();
         Ok(req)
     }
 
@@ -204,7 +205,7 @@ impl RequestHeader {
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid value while append")?;
         append_header_value(
-            self.header_name_map.as_mut(),
+            &mut self.name_case,
             &mut self.base.headers,
             name,
             header_value,
@@ -224,7 +225,7 @@ impl RequestHeader {
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid value while insert")?;
         insert_header_value(
-            self.header_name_map.as_mut(),
+            &mut self.name_case,
             &mut self.base.headers,
             name,
             header_value,
@@ -236,14 +237,14 @@ impl RequestHeader {
     where
         &'a N: 'a + AsHeaderName,
     {
-        remove_header(self.header_name_map.as_mut(), &mut self.base.headers, name)
+        remove_header(&mut self.name_case, &mut self.base.headers, name)
     }
 
     /// Write the header to the `buf` in HTTP/1.1 wire format.
     ///
     /// The header case will be preserved.
     pub fn header_to_h1_wire(&self, buf: &mut impl BufMut) {
-        header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
+        self.name_case.write_h1(&self.base.headers, buf)
     }
 
     /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
@@ -251,19 +252,19 @@ impl RequestHeader {
     ///
     /// Headers of the same name are visited in insertion order.
     pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
-        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+        case_header_iter(self.name_case.view(&self.base.headers), &self.base.headers)
     }
 
     /// Returns true if the request has case-sensitive headers.
     pub fn has_case(&self) -> bool {
-        self.header_name_map.is_some()
+        self.name_case.is_preserved()
     }
 
     pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
         &self,
         mut f: F,
     ) -> Result<()> {
-        let key_map = self.header_name_map.as_ref();
+        let key_map = self.name_case.view(&self.base.headers);
         let value_map = &self.base.headers;
 
         if let Some(key_map) = key_map {
@@ -406,7 +407,7 @@ impl Clone for RequestHeader {
     fn clone(&self) -> Self {
         Self {
             base: self.as_owned_parts(),
-            header_name_map: self.header_name_map.clone(),
+            name_case: self.name_case.clone(),
             raw_target: self.raw_target.clone(),
             send_end_stream: self.send_end_stream,
         }
@@ -421,7 +422,7 @@ impl From<ReqParts> for RequestHeader {
     fn from(parts: ReqParts) -> RequestHeader {
         Self {
             base: parts,
-            header_name_map: None,
+            name_case: NameCase::Off,
             // The Uri is the only target available here, so it is the one that serializes.
             raw_target: RawTarget::FromUri,
             send_end_stream: true,
@@ -451,8 +452,8 @@ impl From<RequestHeader> for ReqParts {
 #[derive(Debug)]
 pub struct ResponseHeader {
     base: RespParts,
-    // an ordered header map to store the original case of each header name
-    header_name_map: Option<CaseMap>,
+    // the original case of each header name
+    name_case: NameCase,
     // the reason phrase of the response, if unset, a default one will be used
     reason_phrase: Option<String>,
 }
@@ -475,7 +476,7 @@ impl Clone for ResponseHeader {
     fn clone(&self) -> Self {
         Self {
             base: self.as_owned_parts(),
-            header_name_map: self.header_name_map.clone(),
+            name_case: self.name_case.clone(),
             reason_phrase: self.reason_phrase.clone(),
         }
     }
@@ -486,7 +487,7 @@ impl From<RespParts> for ResponseHeader {
     fn from(parts: RespParts) -> ResponseHeader {
         Self {
             base: parts,
-            header_name_map: None,
+            name_case: NameCase::Off,
             reason_phrase: None,
         }
     }
@@ -507,9 +508,7 @@ impl From<Box<ResponseHeader>> for Box<RespParts> {
 impl ResponseHeader {
     fn new(size_hint: Option<usize>) -> Self {
         let mut resp_header = Self::new_no_case(size_hint);
-        resp_header.header_name_map = Some(CaseMap::with_capacity(http_header_map_upper_bound(
-            size_hint,
-        )));
+        resp_header.name_case = NameCase::preserved();
         resp_header
     }
 
@@ -518,7 +517,7 @@ impl ResponseHeader {
         base.headers.reserve(http_header_map_upper_bound(size_hint));
         ResponseHeader {
             base,
-            header_name_map: None,
+            name_case: NameCase::Off,
             reason_phrase: None,
         }
     }
@@ -558,7 +557,7 @@ impl ResponseHeader {
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid value while append")?;
         append_header_value(
-            self.header_name_map.as_mut(),
+            &mut self.name_case,
             &mut self.base.headers,
             name,
             header_value,
@@ -578,7 +577,7 @@ impl ResponseHeader {
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid value while insert")?;
         insert_header_value(
-            self.header_name_map.as_mut(),
+            &mut self.name_case,
             &mut self.base.headers,
             name,
             header_value,
@@ -590,14 +589,14 @@ impl ResponseHeader {
     where
         &'a N: 'a + AsHeaderName,
     {
-        remove_header(self.header_name_map.as_mut(), &mut self.base.headers, name)
+        remove_header(&mut self.name_case, &mut self.base.headers, name)
     }
 
     /// Write the header to the `buf` in HTTP/1.1 wire format.
     ///
     /// The header case will be preserved.
     pub fn header_to_h1_wire(&self, buf: &mut impl BufMut) {
-        header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
+        self.name_case.write_h1(&self.base.headers, buf)
     }
 
     /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
@@ -605,19 +604,19 @@ impl ResponseHeader {
     ///
     /// Headers of the same name are visited in insertion order.
     pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
-        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+        case_header_iter(self.name_case.view(&self.base.headers), &self.base.headers)
     }
 
     /// Returns true if the response has case-sensitive headers.
     pub fn has_case(&self) -> bool {
-        self.header_name_map.is_some()
+        self.name_case.is_preserved()
     }
 
     pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
         &self,
         mut f: F,
     ) -> Result<()> {
-        let key_map = self.header_name_map.as_ref();
+        let key_map = self.name_case.view(&self.base.headers);
         let value_map = &self.base.headers;
 
         if let Some(key_map) = key_map {
@@ -847,7 +846,7 @@ fn http_header_map_upper_bound(size_hint: Option<usize>) -> usize {
 
 #[inline]
 fn append_header_value<T>(
-    name_map: Option<&mut CaseMap>,
+    name_case: &mut NameCase,
     value_map: &mut HMap<T>,
     name: impl IntoCaseHeaderName,
     value: T,
@@ -855,17 +854,12 @@ fn append_header_value<T>(
     let (header_name, case_header_name) = name
         .into_header_name_and_case()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
-    // store the original case in the map
-    if let Some(name_map) = name_map {
-        // Use the non-panicking `try_append`: the infallible `append` calls
-        // `.expect("size overflows MAX_SIZE")` internally, which would abort the
-        // process if the case map ever exceeded `http`'s `MAX_SIZE` (1 << 15).
-        name_map
-            .try_append(header_name.clone(), case_header_name)
-            .or_err(InvalidHTTPHeader, "header name map size overflows MAX_SIZE")?;
-    }
+    // store the original case
+    name_case.append(value_map, &header_name, case_header_name)?;
 
-    // Non-panicking `try_append` for the same reason as the case map above.
+    // Use the non-panicking `try_append`: the infallible `append` calls
+    // `.expect("size overflows MAX_SIZE")` internally, which would abort the
+    // process if the map ever exceeded `http`'s `MAX_SIZE` (1 << 15).
     value_map.try_append(header_name, value).or_err(
         InvalidHTTPHeader,
         "header value map size overflows MAX_SIZE",
@@ -874,7 +868,7 @@ fn append_header_value<T>(
 
 #[inline]
 fn insert_header_value<T>(
-    name_map: Option<&mut CaseMap>,
+    name_case: &mut NameCase,
     value_map: &mut HMap<T>,
     name: impl IntoCaseHeaderName,
     value: T,
@@ -882,10 +876,8 @@ fn insert_header_value<T>(
     let (header_name, case_header_name) = name
         .into_header_name_and_case()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
-    if let Some(name_map) = name_map {
-        // store the original case in the map
-        name_map.insert(header_name.clone(), case_header_name);
-    }
+    // store the original case
+    name_case.insert(value_map, &header_name, case_header_name);
     value_map.insert(header_name, value);
     Ok(())
 }
@@ -893,7 +885,7 @@ fn insert_header_value<T>(
 // the &N here is to avoid clone(). None Copy type like String can impl AsHeaderName
 #[inline]
 fn remove_header<'a, T, N: ?Sized>(
-    name_map: Option<&mut CaseMap>,
+    name_case: &mut NameCase,
     value_map: &mut HMap<T>,
     name: &'a N,
 ) -> Option<T>
@@ -902,9 +894,9 @@ where
 {
     let removed = value_map.remove(name);
     if removed.is_some() {
-        if let Some(name_map) = name_map {
+        name_case.removed(value_map, |name_map| {
             name_map.remove(name);
-        }
+        });
     }
     removed
 }
@@ -1004,30 +996,6 @@ fn normalize_field_value(raw: bytes::Bytes) -> bytes::Bytes {
         push_with_replacement(&mut unfolded, line);
     }
     bytes::Bytes::from(unfolded)
-}
-
-#[inline]
-fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl BufMut) {
-    const CRLF: &[u8; 2] = b"\r\n";
-    const HEADER_KV_DELIMITER: &[u8; 2] = b": ";
-
-    if let Some(key_map) = key_map {
-        case_header_iter(key_map.into(), value_map).for_each(|(case_header, val)| {
-            buf.put_slice(case_header.as_slice());
-            buf.put_slice(HEADER_KV_DELIMITER);
-            buf.put_slice(val.as_ref());
-            buf.put_slice(CRLF);
-        });
-    } else {
-        for (header, value) in value_map {
-            let titled_header =
-                case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
-            buf.put_slice(titled_header.as_bytes());
-            buf.put_slice(HEADER_KV_DELIMITER);
-            buf.put_slice(value.as_ref());
-            buf.put_slice(CRLF);
-        }
-    }
 }
 
 #[inline]
