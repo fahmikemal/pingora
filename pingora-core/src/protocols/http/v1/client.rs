@@ -22,6 +22,7 @@ use pingora_http::{HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::str;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -53,6 +54,9 @@ pub struct HttpSession {
     keepalive_timeout: KeepaliveStatus,
     pub(crate) digest: Box<Digest>,
     response_header: Option<Box<ResponseHeader>>,
+    /// Set once [`Self::read_response_task`] has handed a final response header to its caller
+    /// instead of copying it; `response_header` is then `None`.
+    handed_off: Option<HandedOff>,
     request_written: Option<Box<RequestHeader>>,
     bytes_sent: usize,
     /// Total response body payload bytes received from upstream
@@ -67,6 +71,68 @@ pub struct HttpSession {
     // If allowed, does not fail with error on invalid content-length
     // (treats as close-delimited response).
     allow_h1_response_invalid_content_length: bool,
+}
+
+/// What a session keeps of a final response header it moved out to the caller of
+/// [`HttpSession::read_response_task`], which would otherwise get a copy. Body framing is set up
+/// from the header before it goes; the rest of the session's own needs are recorded here.
+#[derive(Debug)]
+struct HandedOff {
+    status: StatusCode,
+    /// [`HttpSession::header_keepalive`] of the header.
+    keepalive: Option<u64>,
+    /// The header parsed again from the raw bytes, for callers that still ask for it.
+    rebuilt: OnceLock<Option<Box<ResponseHeader>>>,
+}
+
+/// Start a [`ResponseHeader`] from a parsed status line.
+fn response_header_head(resp: &httparse::Response) -> Result<Box<ResponseHeader>> {
+    let mut response_header = Box::new(ResponseHeader::build(
+        resp.code.unwrap(),
+        Some(resp.headers.len()),
+    )?);
+
+    // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
+    // "Since HTTP/1.0 did not define any 1xx status codes,
+    // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
+    response_header.set_version(match resp.version {
+        Some(1) => Version::HTTP_11,
+        Some(0) => Version::HTTP_10,
+        _ => Version::HTTP_09,
+    });
+
+    response_header.set_reason_phrase(resp.reason)?;
+    Ok(response_header)
+}
+
+/// Add the header fields found at `header_refs` in `buf`.
+fn add_response_headers(
+    response_header: &mut ResponseHeader,
+    header_refs: Vec<KVRef>,
+    buf: &Bytes,
+) -> Result<()> {
+    for header in header_refs {
+        let header_name = header.get_name_bytes(buf);
+        let header_name = header_name.into_case_header_name();
+        let value_bytes = header.get_value_bytes(buf);
+        let header_value = pingora_http::header_value_from_raw(value_bytes);
+        response_header
+            .append_header(header_name, header_value)
+            .or_err(InvalidHTTPHeader, "while parsing request header")?;
+    }
+
+    let contains_transfer_encoding = response_header
+        .headers
+        .contains_key(header::TRANSFER_ENCODING);
+    let contains_content_length = response_header.headers.contains_key(header::CONTENT_LENGTH);
+
+    // Transfer encoding overrides content length, so when
+    // both are present, we MUST remove content length. This is
+    // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
+    if contains_content_length && contains_transfer_encoding {
+        response_header.remove_header(&header::CONTENT_LENGTH);
+    }
+    Ok(())
 }
 
 /// HTTP 1.x client session
@@ -90,6 +156,7 @@ impl HttpSession {
             body_writer: BodyWriter::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             response_header: None,
+            handed_off: None,
             request_written: None,
             read_timeout: None,
             write_timeout: None,
@@ -284,59 +351,24 @@ impl HttpSession {
                         // while header_refs doesn't as it is still empty
                         let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
 
-                        let mut response_header = match ResponseHeader::build(
-                            resp.code.unwrap(),
-                            Some(resp.headers.len()),
-                        ) {
-                            Ok(header) => Box::new(header),
+                        let mut response_header = match response_header_head(&resp) {
+                            Ok(header) => header,
                             Err(e) => return self.fail_response_header_read(e),
                         };
 
-                        // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
-                        // "Since HTTP/1.0 did not define any 1xx status codes,
-                        // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
-                        response_header.set_version(match resp.version {
-                            Some(1) => Version::HTTP_11,
-                            Some(0) => Version::HTTP_10,
-                            _ => Version::HTTP_09,
-                        });
-
-                        if let Err(e) = response_header.set_reason_phrase(resp.reason) {
-                            return self.fail_response_header_read(e);
-                        }
-
                         let buf = std::mem::take(&mut self.response_header_read_buf).freeze();
 
-                        for header in header_refs {
-                            let header_name = header.get_name_bytes(&buf);
-                            let header_name = header_name.into_case_header_name();
-                            let value_bytes = header.get_value_bytes(&buf);
-                            let header_value = pingora_http::header_value_from_raw(value_bytes);
-                            if let Err(e) = response_header
-                                .append_header(header_name, header_value)
-                                .or_err(InvalidHTTPHeader, "while parsing request header")
-                            {
-                                return self.fail_response_header_read(e);
-                            }
-                        }
-
-                        let contains_transfer_encoding = response_header
-                            .headers
-                            .contains_key(header::TRANSFER_ENCODING);
-                        let contains_content_length =
-                            response_header.headers.contains_key(header::CONTENT_LENGTH);
-
-                        // Transfer encoding overrides content length, so when
-                        // both are present, we MUST remove content length. This is
-                        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
-                        if contains_content_length && contains_transfer_encoding {
-                            response_header.remove_header(&header::CONTENT_LENGTH);
+                        if let Err(e) =
+                            add_response_headers(&mut response_header, header_refs, &buf)
+                        {
+                            return self.fail_response_header_read(e);
                         }
 
                         self.raw_header = Some(BufRef(0, s));
                         self.preread_body = Some(BufRef(s, total_read));
                         self.buf = buf;
                         self.response_header = Some(response_header);
+                        self.handed_off = None;
                         if let Err(e) = self.validate_response() {
                             return self.fail_response_header_read(e);
                         }
@@ -443,7 +475,46 @@ impl HttpSession {
 
     /// Return a reference of the [`ResponseHeader`] if the response is read
     pub fn resp_header(&self) -> Option<&ResponseHeader> {
-        self.response_header.as_deref()
+        match (&self.response_header, &self.handed_off) {
+            (Some(header), _) => Some(header),
+            (None, Some(h)) => h.rebuilt.get_or_init(|| self.parse_raw_header()).as_deref(),
+            (None, None) => None,
+        }
+    }
+
+    /// The header read last, built again from its raw bytes the way [`Self::read_response`]
+    /// built it.
+    fn parse_raw_header(&self) -> Option<Box<ResponseHeader>> {
+        let raw = self.raw_header.as_ref()?;
+        let raw = self.buf.slice(raw.0..raw.1);
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut resp = httparse::Response::new(&mut headers);
+        let HeaderParseState::Complete(_) = parse_resp_buffer(&mut resp, &raw) else {
+            return None;
+        };
+        let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
+        populate_headers(raw.as_ptr() as usize, &mut header_refs, resp.headers);
+        let mut header = response_header_head(&resp).ok()?;
+        add_response_headers(&mut header, header_refs, &raw).ok()?;
+        Some(header)
+    }
+
+    /// The header just read, for the caller to keep. A final response's header is moved out
+    /// rather than copied (see [`HandedOff`]); an informational one stays, as the session
+    /// still has to read past it.
+    fn hand_off_resp_header(&mut self) -> Box<ResponseHeader> {
+        let header = self.response_header.as_deref().expect("just read");
+        if header.status.is_informational() {
+            return Box::new(header.clone());
+        }
+        let keepalive = self.header_keepalive();
+        let header = self.response_header.take().expect("just read");
+        self.handed_off = Some(HandedOff {
+            status: header.status,
+            keepalive,
+            rebuilt: OnceLock::new(),
+        });
+        header
     }
 
     /// Get the header value for the given header name from the response header
@@ -463,7 +534,11 @@ impl HttpSession {
 
     /// Return the status code of the response if read
     pub fn get_status(&self) -> Option<StatusCode> {
-        self.response_header.as_ref().map(|h| h.status)
+        match (&self.response_header, &self.handed_off) {
+            (Some(header), _) => Some(header.status),
+            (None, Some(h)) => Some(h.status),
+            (None, None) => None,
+        }
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -571,32 +646,39 @@ impl HttpSession {
             return;
         }
 
+        let keepalive = match &self.handed_off {
+            Some(h) => h.keepalive,
+            None => self.header_keepalive(),
+        };
+        self.set_keepalive(keepalive);
+    }
+
+    /// The reuse the response (and request) header allow: `None` to close the connection, else
+    /// the idle timeout in seconds, 0 for none.
+    fn header_keepalive(&self) -> Option<u64> {
+        let version = self.resp_header().map(|h| h.version);
         // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
         // if Transfer-Encoding is received in HTTP/1.0 response, connection MUST be closed after processing.
-        if self.resp_header().map(|h| h.version) == Some(Version::HTTP_10)
+        if version == Some(Version::HTTP_10)
             && self
                 .resp_header()
                 .and_then(|h| h.headers.get(header::TRANSFER_ENCODING))
                 .is_some()
         {
-            self.set_keepalive(None);
-            return;
+            return None;
         }
         if let Some(keepalive) = self.is_connection_keepalive() {
             if keepalive {
                 let (timeout, _max_use) = self.get_keepalive_values();
                 // TODO: respect max_use
-                match timeout {
-                    Some(d) => self.set_keepalive(Some(d)),
-                    None => self.set_keepalive(Some(0)), // infinite
-                }
+                Some(timeout.unwrap_or(0)) // 0: infinite
             } else {
-                self.set_keepalive(None);
+                None
             }
-        } else if self.resp_header().map(|h| h.version) == Some(Version::HTTP_11) {
-            self.set_keepalive(Some(0)); // on by default for http 1.1
+        } else if version == Some(Version::HTTP_11) {
+            Some(0) // on by default for http 1.1
         } else {
-            self.set_keepalive(None); // off by default for http 1.0
+            None // off by default for http 1.0
         }
     }
 
@@ -810,7 +892,8 @@ impl HttpSession {
 
     pub async fn read_response_task(&mut self) -> Result<HttpTask> {
         if self.should_read_resp_header() {
-            let resp_header = self.read_resp_header_parts().await?;
+            self.read_response().await?;
+            let resp_header = self.hand_off_resp_header();
             let end_of_body = self.is_body_done();
             debug!("Response header: {resp_header:?}");
             trace!(
@@ -989,6 +1072,124 @@ mod tests_stream {
             http_stream.resp_header().unwrap().get_reason_phrase(),
             Some("Just Fine")
         );
+    }
+
+    fn wire(h: &ResponseHeader) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        h.header_to_h1_wire(&mut buf);
+        buf.to_vec()
+    }
+
+    fn session(input: &str, req_connection: Option<&str>) -> HttpSession {
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        if let Some(c) = req_connection {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            req.insert_header("Connection", c).unwrap();
+            http_stream.request_written = Some(Box::new(req));
+        }
+        http_stream
+    }
+
+    #[rstest]
+    #[case::plain(
+        "HTTP/1.1 200 OK\r\nServer: Test\r\nContent-Length: 3\r\n\r\nabc",
+        None,
+        KeepaliveStatus::Infinite
+    )]
+    #[case::timeout("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=7, max=10\r\nContent-Length: 0\r\n\r\n", None, KeepaliveStatus::Timeout(Duration::from_secs(7)))]
+    #[case::close(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        None,
+        KeepaliveStatus::Off
+    )]
+    #[case::request_close(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        Some("close"),
+        KeepaliveStatus::Off
+    )]
+    #[case::http10(
+        "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n",
+        None,
+        KeepaliveStatus::Off
+    )]
+    #[case::http10_keepalive(
+        "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        None,
+        KeepaliveStatus::Infinite
+    )]
+    #[case::http10_chunked(
+        "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        None,
+        KeepaliveStatus::Off
+    )]
+    #[case::te_and_cl(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        None,
+        KeepaliveStatus::Infinite
+    )]
+    #[case::name_case("HTTP/1.1 204 No Content\r\nX-Mixed-CASE: v\r\nx-lower: v\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n", None, KeepaliveStatus::Infinite)]
+    #[tokio::test]
+    async fn read_response_task_hands_off_final_header(
+        #[case] input: &str,
+        #[case] req_connection: Option<&str>,
+        #[case] keepalive: KeepaliveStatus,
+    ) {
+        init_log();
+        // What read_response() leaves in the session, as before the header was handed off.
+        let mut reference = session(input, req_connection);
+        reference.read_response().await.unwrap();
+        while reference.read_body_ref().await.unwrap().is_some() {}
+        reference.respect_keepalive();
+        let want = wire(reference.resp_header().unwrap());
+
+        let mut http_stream = session(input, req_connection);
+        let mut handed = None;
+        loop {
+            match http_stream.read_response_task().await.unwrap() {
+                HttpTask::Header(h, end) => {
+                    handed = Some(h);
+                    if end {
+                        break;
+                    }
+                }
+                HttpTask::Body(_, true) | HttpTask::Done => break,
+                HttpTask::Body(_, false) => {}
+                task => panic!("unexpected task {task:?}"),
+            }
+        }
+        // Moved, not copied.
+        assert!(http_stream.response_header.is_none());
+        assert_eq!(wire(&handed.unwrap()), want);
+        assert_eq!(http_stream.get_status(), reference.get_status());
+        // Still there for callers that ask.
+        assert_eq!(wire(http_stream.resp_header().unwrap()), want);
+        http_stream.respect_keepalive();
+        assert_eq!(http_stream.keepalive_timeout, keepalive);
+        assert_eq!(reference.keepalive_timeout, keepalive);
+    }
+
+    #[tokio::test]
+    async fn read_response_task_keeps_informational_header() {
+        init_log();
+        let input = "HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut http_stream = session(input, None);
+        match http_stream.read_response_task().await.unwrap() {
+            HttpTask::Header(h, false) => assert_eq!(h.status, 103),
+            task => panic!("unexpected task {task:?}"),
+        }
+        // The session reads past a 1xx header, so it keeps its own.
+        assert_eq!(http_stream.resp_header().unwrap().status, 103);
+        assert!(http_stream.handed_off.is_none());
+        match http_stream.read_response_task().await.unwrap() {
+            HttpTask::Header(h, true) => assert_eq!(h.status, 200),
+            task => panic!("unexpected task {task:?}"),
+        }
+        assert!(http_stream.response_header.is_none());
+        let rebuilt = http_stream.resp_header().unwrap();
+        assert_eq!(rebuilt.status, 200);
+        assert_eq!(rebuilt.headers.get("Content-Length").unwrap(), "0");
+        assert!(rebuilt.headers.get("Link").is_none());
     }
 
     #[tokio::test]
