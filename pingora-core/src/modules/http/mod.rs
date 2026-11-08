@@ -30,9 +30,7 @@ use once_cell::sync::OnceCell;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
-use std::any::TypeId;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
 
 /// The trait an HTTP traffic module needs to implement
 #[async_trait]
@@ -101,7 +99,8 @@ pub type ModuleBuilder = Box<dyn HttpModuleBuilder + 'static + Send + Sync>;
 /// The object to hold multiple http modules
 pub struct HttpModules {
     modules: Vec<ModuleBuilder>,
-    module_index: OnceCell<Arc<HashMap<TypeId, usize>>>,
+    /// Set once the first context is built, after checking each module type appears once.
+    built: OnceCell<()>,
 }
 
 impl HttpModules {
@@ -109,7 +108,7 @@ impl HttpModules {
     pub fn new() -> Self {
         HttpModules {
             modules: vec![],
-            module_index: OnceCell::new(),
+            built: OnceCell::new(),
         }
     }
 
@@ -119,9 +118,8 @@ impl HttpModules {
     /// # Panic
     /// Panic if any [HttpModule] is added more than once.
     pub fn add_module(&mut self, builder: ModuleBuilder) {
-        if self.module_index.get().is_some() {
-            // We use a shared module_index the index would be out of sync if we
-            // add more modules.
+        if self.built.get().is_some() {
+            // Contexts already handed out would not have the new module.
             panic!("cannot add module after ctx is already built")
         }
         self.modules.push(builder);
@@ -133,24 +131,15 @@ impl HttpModules {
     /// Build the contexts of all the modules added to this [HttpModules]
     pub fn build_ctx(&self) -> HttpModuleCtx {
         let module_ctx: Vec<_> = self.modules.iter().map(|b| b.init()).collect();
-        let module_index = self
-            .module_index
-            .get_or_init(|| {
-                let mut module_index = HashMap::with_capacity(self.modules.len());
-                for (i, c) in module_ctx.iter().enumerate() {
-                    let exist = module_index.insert(c.as_any().type_id(), i);
-                    if exist.is_some() {
-                        panic!("duplicated filters found")
-                    }
+        self.built.get_or_init(|| {
+            let mut seen = HashSet::with_capacity(module_ctx.len());
+            for c in &module_ctx {
+                if !seen.insert(c.as_any().type_id()) {
+                    panic!("duplicated filters found")
                 }
-                Arc::new(module_index)
-            })
-            .clone();
-
-        HttpModuleCtx {
-            module_ctx,
-            module_index,
-        }
+            }
+        });
+        HttpModuleCtx { module_ctx }
     }
 }
 
@@ -161,8 +150,6 @@ impl HttpModules {
 pub struct HttpModuleCtx {
     // the modules in the order of execution
     module_ctx: Vec<Module>,
-    // find the module in the vec with its type ID
-    module_index: Arc<HashMap<TypeId, usize>>,
 }
 
 impl HttpModuleCtx {
@@ -170,32 +157,25 @@ impl HttpModuleCtx {
     ///
     /// [HttpModules] should be used to create nonempty [HttpModuleCtx].
     pub fn empty() -> Self {
-        HttpModuleCtx {
-            module_ctx: vec![],
-            module_index: Arc::new(HashMap::new()),
-        }
+        HttpModuleCtx { module_ctx: vec![] }
     }
 
     /// Get a ref to [HttpModule] if any.
+    ///
+    /// A request has a handful of modules at most, so they are searched in order: cheaper
+    /// than hashing the type ID, and the context needs no shared index whose reference count
+    /// every request on every thread would bump.
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        let idx = self.module_index.get(&TypeId::of::<T>())?;
-        let ctx = &self.module_ctx[*idx];
-        Some(
-            ctx.as_any()
-                .downcast_ref::<T>()
-                .expect("type should always match"),
-        )
+        self.module_ctx
+            .iter()
+            .find_map(|m| m.as_any().downcast_ref::<T>())
     }
 
     /// Get a mut ref to [HttpModule] if any.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        let idx = self.module_index.get(&TypeId::of::<T>())?;
-        let ctx = &mut self.module_ctx[*idx];
-        Some(
-            ctx.as_any_mut()
-                .downcast_mut::<T>()
-                .expect("type should always match"),
-        )
+        self.module_ctx
+            .iter_mut()
+            .find_map(|m| m.as_any_mut().downcast_mut::<T>())
     }
 
     /// Run the `request_header_filter` for all the modules according to their orders.
