@@ -175,7 +175,28 @@ impl ConnectionNominations {
     }
 }
 
+/// Whether `name` is one of the fields [strip_standard_hop_by_hop_headers()] removes.
+fn is_standard_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        *name,
+        header::PROXY_AUTHENTICATE
+            | header::PROXY_AUTHORIZATION
+            | header::TE
+            | header::TRAILER
+            | header::TRANSFER_ENCODING
+            | header::CONNECTION
+            | header::UPGRADE
+    ) || name == KEEP_ALIVE
+        || name == PROXY_CONNECTION
+        || name == HTTP2_SETTINGS
+}
+
 fn strip_standard_hop_by_hop_headers(req: &mut RequestHeader) {
+    // Most requests carry none of these fields. One pass over the names present is cheaper than
+    // ten lookups that find nothing.
+    if !req.headers.keys().any(is_standard_hop_by_hop) {
+        return;
+    }
     req.remove_header(KEEP_ALIVE);
     req.remove_header(PROXY_CONNECTION);
     req.remove_header(&header::PROXY_AUTHENTICATE);
@@ -546,6 +567,40 @@ impl PipeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_each_standard_hop_by_hop_field_alone() {
+        let names = [
+            "Keep-Alive",
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Connection",
+            "Upgrade",
+            "HTTP2-Settings",
+        ];
+        for name in names {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            req.insert_header("Host", "example.com").unwrap();
+            req.insert_header(name, "x").unwrap();
+            req.insert_header("X-Keep", "1").unwrap();
+            assert!(is_standard_hop_by_hop(&HeaderName::try_from(name).unwrap()));
+            strip_standard_hop_by_hop_headers(&mut req);
+            assert!(!req.headers.contains_key(name), "{name} was kept");
+            assert_eq!(req.headers.len(), 2, "{name}: other fields were removed");
+            let mut wire = Vec::new();
+            req.header_to_h1_wire(&mut wire);
+            assert_eq!(wire, b"Host: example.com\r\nX-Keep: 1\r\n", "{name}");
+        }
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("Keep-Alive-Not", "1").unwrap();
+        strip_standard_hop_by_hop_headers(&mut req);
+        assert_eq!(req.headers.len(), 2);
+    }
 
     fn request_with_headers(headers: &[(&str, &str)]) -> RequestHeader {
         let mut request = RequestHeader::build("GET", b"/", Some(headers.len())).unwrap();
