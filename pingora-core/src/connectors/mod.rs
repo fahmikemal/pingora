@@ -256,7 +256,7 @@ impl TransportConnector {
             // first on an idle stream.
             #[cfg(unix)]
             {
-                peer.matches_fd(stream.id())
+                peer.matches_stream(stream)
                     && test_reusable_stream(stream, &self.unexpected_data_conn_count)
             }
             #[cfg(windows)]

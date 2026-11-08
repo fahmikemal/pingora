@@ -23,6 +23,8 @@ use crate::protocols::tls::HandshakeCompleteHook;
 use crate::protocols::tls::PskType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
+#[cfg(unix)]
+use crate::protocols::Stream;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
@@ -259,6 +261,13 @@ pub trait Peer: Display + Clone {
     #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
+    }
+
+    /// Whether `stream`, an idle connection pooled under this peer's [Self::reuse_hash()], is
+    /// connected to this peer. By default this asks the kernel, through [Self::matches_fd()].
+    #[cfg(unix)]
+    fn matches_stream(&self, stream: &Stream) -> bool {
+        self.matches_fd(stream.id())
     }
 
     #[cfg(windows)]
@@ -855,6 +864,33 @@ impl Peer for HttpPeer {
         }
     }
 
+    /// Compares the address the stream was connected to, which the TCP connector records in
+    /// the stream's digest, instead of calling getpeername() on every reuse. Falls back to
+    /// [Self::matches_fd()] for proxied peers and streams without a recorded address.
+    #[cfg(unix)]
+    fn matches_stream(&self, stream: &Stream) -> bool {
+        if self.get_proxy().is_none() {
+            if let SocketAddr::Inet(want) = self.address() {
+                let digest = stream.get_socket_digest();
+                let connected = digest
+                    .as_ref()
+                    .and_then(|d| d.peer_addr.get())
+                    .and_then(|addr| addr.as_ref())
+                    .and_then(|addr| addr.as_inet());
+                if let Some(connected) = connected {
+                    // As in check_fd_match(): 0.0.0.0 may have been connected as 127.0.0.1.
+                    const ZERO: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+                    if want.ip() == ZERO || want == connected {
+                        return true;
+                    }
+                    log::error!("Crit: stream mismatch: want {want}, connected to {connected}");
+                    return false;
+                }
+            }
+        }
+        self.matches_fd(stream.id())
+    }
+
     #[cfg(windows)]
     fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
         use crate::protocols::ConnSockReusable;
@@ -916,5 +952,28 @@ mod tests {
         assert!(!policy.strip_connection_nominated);
         assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_peer_matches_stream_by_the_connected_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let peer = HttpPeer::new(addr, false, "".into());
+        let stream: Stream = Box::new(crate::connectors::l4::connect(&peer, None).await.unwrap());
+        let _server = accept.await.unwrap();
+
+        let recorded = stream.get_socket_digest().unwrap();
+        assert!(
+            recorded.peer_addr.get().is_some(),
+            "connect records the address"
+        );
+        assert!(peer.matches_stream(&stream));
+        assert!(peer.matches_fd(stream.id()), "agrees with getpeername()");
+
+        let other = HttpPeer::new(("127.0.0.1", addr.port() ^ 1), false, "".into());
+        assert!(!other.matches_stream(&stream));
+        assert!(!other.matches_fd(stream.id()));
     }
 }
