@@ -85,6 +85,8 @@ pub mod prelude {
 
     #[cfg(feature = "cache")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
+    // pingora_cache's prelude is empty, which recent rustc reports as an unused import.
+    #[allow(unused_imports)]
     pub use pingora_cache::prelude::*;
 
     #[cfg(feature = "lb")]
