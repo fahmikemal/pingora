@@ -29,7 +29,7 @@ use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
@@ -213,31 +213,51 @@ impl HttpSession {
         &mut self,
         buf: &mut BytesMut,
         already_read: usize,
+        deadline: Option<Instant>,
     ) -> Result<Option<usize>> {
         let read_result = {
             let read_event = self.underlying_stream.read_buf(buf);
-            match self.keepalive_timeout {
-                KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
+            if let Some(deadline) = deadline {
+                // Part of the header is in: the rest must arrive by the deadline however it
+                // trickles in. A timeout per read would let a client that sends a byte now
+                // and then hold the connection forever.
+                let left = deadline.saturating_duration_since(Instant::now());
+                match timeout(left, read_event).await {
                     Ok(res) => res,
-                    Err(e) => {
-                        debug!("keepalive timeout {d:?} reached, {e}");
-                        return Ok(None);
+                    Err(_) => {
+                        return Error::e_explain(
+                            ReadTimedout,
+                            format!(
+                                "request header incomplete after {:?}",
+                                self.read_timeout.unwrap_or_default()
+                            ),
+                        );
                     }
-                },
-                KeepaliveStatus::Infinite => {
-                    // FIXME: this should only apply to reads between requests
-                    read_event.await
                 }
-                KeepaliveStatus::Off => match self.read_timeout {
-                    Some(t) => match timeout(t, read_event).await {
+            } else {
+                match self.keepalive_timeout {
+                    KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
                         Ok(res) => res,
                         Err(e) => {
-                            debug!("read timeout {t:?} reached, {e}");
-                            return Error::e_explain(ReadTimedout, format!("timeout: {t:?}"));
+                            debug!("keepalive timeout {d:?} reached, {e}");
+                            return Ok(None);
                         }
                     },
-                    None => read_event.await,
-                },
+                    KeepaliveStatus::Infinite => {
+                        // FIXME: this should only apply to reads between requests
+                        read_event.await
+                    }
+                    KeepaliveStatus::Off => match self.read_timeout {
+                        Some(t) => match timeout(t, read_event).await {
+                            Ok(res) => res,
+                            Err(e) => {
+                                debug!("read timeout {t:?} reached, {e}");
+                                return Error::e_explain(ReadTimedout, format!("timeout: {t:?}"));
+                            }
+                        },
+                        None => read_event.await,
+                    },
+                }
             }
         };
 
@@ -303,6 +323,13 @@ impl HttpSession {
             .unwrap_or_else(|| BytesMut::with_capacity(INIT_HEADER_BUF_SIZE));
         let mut already_read = buf.len();
         let mut skip_next_read = already_read != 0;
+        // Once part of the header is in, all of it must arrive within `read_timeout`.
+        let header_deadline = |t: Option<Duration>| t.map(|t| Instant::now() + t);
+        let mut deadline = if already_read != 0 {
+            header_deadline(self.read_timeout)
+        } else {
+            None
+        };
         let mut detached_suffix = None;
         loop {
             if already_read > MAX_HEADER_SIZE {
@@ -323,8 +350,14 @@ impl HttpSession {
             // this request and is waiting for our response).
             if skip_next_read {
                 skip_next_read = false;
-            } else if let Some(n) = self.read_request_buf(&mut buf, already_read).await? {
+            } else if let Some(n) = self
+                .read_request_buf(&mut buf, already_read, deadline)
+                .await?
+            {
                 already_read += n;
+                if deadline.is_none() && already_read != 0 {
+                    deadline = header_deadline(self.read_timeout);
+                }
             } else {
                 return Ok(None);
             }
@@ -3461,6 +3494,44 @@ mod test_proxy_tasks {
         let res = test_read_with_tokio_timeout(http_stream.read_request()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+    }
+
+    #[tokio::test]
+    async fn read_timeout_bounds_the_whole_request_header() {
+        // Each piece arrives well within the read timeout, but together they take longer.
+        let trickle = |end: &'static [u8]| {
+            let mut b = Builder::new();
+            b.read(b"GET / HTTP/1.1\r\n")
+                .wait(Duration::from_millis(400))
+                .read(b"Host: a\r\n")
+                .wait(Duration::from_millis(400))
+                .read(b"X-A: b\r\n")
+                .wait(Duration::from_millis(400));
+            if end.is_empty() {
+                // Never finishes within the test (a pending wait is not unread data).
+                b.wait(Duration::from_secs(30));
+            } else {
+                b.read(end);
+            }
+            Box::new(b.build())
+        };
+        let mut http_stream = HttpSession::new(trickle(b""));
+        http_stream.read_timeout = Some(Duration::from_secs(1));
+        let started = Instant::now();
+        let err = http_stream.read_request().await.unwrap_err();
+        assert_eq!(err.etype(), &ReadTimedout);
+        assert!(started.elapsed() < Duration::from_millis(1500));
+
+        // The same header within the limit is read.
+        let mut http_stream = HttpSession::new(trickle(b"\r\n"));
+        http_stream.read_timeout = Some(Duration::from_secs(2));
+        assert!(http_stream.read_request().await.unwrap().is_some());
+        assert_eq!(http_stream.req_header().headers.get("x-a").unwrap(), "b");
+
+        // Without a read timeout nothing changes.
+        let mut http_stream = HttpSession::new(trickle(b"\r\n"));
+        http_stream.read_timeout = None;
+        assert!(http_stream.read_request().await.unwrap().is_some());
     }
 
     #[tokio::test]
