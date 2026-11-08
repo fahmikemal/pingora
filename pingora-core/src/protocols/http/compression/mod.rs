@@ -976,15 +976,57 @@ fn test_will_decompress_agrees_with_response_header_filter() {
     }
 }
 
-use once_cell::sync::Lazy;
-use regex::Regex;
-
 // Allow text, application, font, a few image/ MIME types and binary/octet-stream
 // TODO: fine tune this list
-static MIME_CHECK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?:text/|application/|font/|image/(?:x-icon|svg\+xml|nd\.microsoft\.icon)|binary/octet-stream)")
-        .unwrap()
-});
+const COMPRESSIBLE_MIME_PREFIXES: [&str; 7] = [
+    "text/",
+    "application/",
+    "font/",
+    "image/x-icon",
+    "image/svg+xml",
+    "image/nd.microsoft.icon",
+    "binary/octet-stream",
+];
+
+/// Whether a Content-Type is in the compressible list: a plain prefix match, case-sensitive,
+/// run on every proxied response while compression is enabled.
+fn compressible_mime(content_type: &str) -> bool {
+    COMPRESSIBLE_MIME_PREFIXES
+        .iter()
+        .any(|prefix| content_type.starts_with(prefix))
+}
+
+#[test]
+fn test_compressible_mime_matches_the_former_regex() {
+    // ^(?:text/|application/|font/|image/(?:x-icon|svg\+xml|nd\.microsoft\.icon)|binary/octet-stream)
+    for yes in [
+        "text/html",
+        "text/plain; charset=utf-8",
+        "application/json",
+        "application/javascript",
+        "font/woff2",
+        "image/x-icon",
+        "image/svg+xml",
+        "image/nd.microsoft.icon",
+        "binary/octet-stream",
+    ] {
+        assert!(compressible_mime(yes), "{yes}");
+    }
+    for no in [
+        "",
+        "image/png",
+        "image/svgxml",
+        "image/vnd.microsoft.icon",
+        "Text/html",
+        " text/html",
+        "video/mp4",
+        "audio/mpeg",
+        "multipart/form-data",
+        "texts/html",
+    ] {
+        assert!(!compressible_mime(no), "{no}");
+    }
+}
 
 // check if the response mime type is compressible
 fn compressible(resp: &ResponseHeader) -> bool {
@@ -1013,7 +1055,7 @@ fn compressible(resp: &ResponseHeader) -> bool {
                 false
             } else {
                 // check if mime type in allow list
-                MIME_CHECK.find(ct_str).is_some()
+                compressible_mime(ct_str)
             }
         } else {
             false // invalid CT header, don't compress
