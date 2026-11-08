@@ -25,6 +25,11 @@ use pingora_core::protocols::http::{
     v1::common::is_upgrade_req as is_h1_upgrade_req,
 };
 
+/// The task pipes between the downstream and upstream halves of a session.
+type PipeTx = task_pipe::Sender<HttpTask, TASK_BUFFER_SIZE>;
+type PipeRx = task_pipe::Receiver<HttpTask, TASK_BUFFER_SIZE>;
+type PipePermit<'a> = task_pipe::Permit<'a, HttpTask, TASK_BUFFER_SIZE>;
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -139,8 +144,8 @@ where
             Err(e) => return (false, false, Some(e)),
         };
 
-        let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
-        let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+        let (tx_upstream, rx_upstream) = task_pipe::channel();
+        let (tx_downstream, rx_downstream) = task_pipe::channel();
 
         session.as_mut().enable_retry_buffering();
 
@@ -248,8 +253,8 @@ where
     async fn proxy_handle_upstream(
         &self,
         client_session: &mut HttpSessionV1,
-        tx: mpsc::Sender<HttpTask>,
-        mut rx: mpsc::Receiver<HttpTask>,
+        tx: PipeTx,
+        mut rx: PipeRx,
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
@@ -365,7 +370,7 @@ where
         session: &mut Session,
         ctx: &mut SV::CTX,
         initial_task: HttpTask,
-        rx: &mut mpsc::Receiver<HttpTask>,
+        rx: &mut PipeRx,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
         response_state: &mut ResponseStateMachine,
@@ -444,8 +449,8 @@ where
     async fn proxy_handle_downstream(
         &self,
         session: &mut Session,
-        tx: mpsc::Sender<HttpTask>,
-        mut rx: mpsc::Receiver<HttpTask>,
+        tx: PipeTx,
+        mut rx: PipeRx,
         ctx: &mut SV::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
@@ -1022,7 +1027,7 @@ where
         session: &mut Session,
         mut data: Option<Bytes>,
         end_of_body: bool,
-        tx: mpsc::Permit<'_, HttpTask>,
+        tx: PipePermit<'_>,
         ctx: &mut SV::CTX,
     ) -> Result<bool>
     where
