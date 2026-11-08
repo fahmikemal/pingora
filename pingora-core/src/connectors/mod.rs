@@ -15,6 +15,7 @@
 //! Connecting to servers
 
 pub mod http;
+mod idle;
 pub mod l4;
 #[cfg(feature = "any_tls")]
 mod tls;
@@ -28,19 +29,19 @@ use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
 
 use crate::offload::OffloadRuntime;
+use idle::IdlePool;
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_pool::{ConnectionMeta, ConnectionPool};
+use pingora_pool::ConnectionMeta;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tls::TlsConnector;
-use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdleConnection {
@@ -170,7 +171,7 @@ impl ConnectorOptions {
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
-    connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
+    idle: Arc<IdlePool>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
@@ -201,14 +202,15 @@ impl TransportConnector {
         let keepalive_pool_callback = options
             .as_ref()
             .and_then(|o| o.keepalive_pool_callback.clone());
+        let unexpected_data_conn_count = Arc::new(AtomicU64::new(0));
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
-            connection_pool: Arc::new(ConnectionPool::new(pool_size)),
+            idle: Arc::new(IdlePool::new(pool_size, unexpected_data_conn_count.clone())),
             offload: offload.map(|v| OffloadRuntime::new("upstream connect offload", v.0, v.1)),
             bind_to_v4,
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),
-            unexpected_data_conn_count: Arc::new(AtomicU64::new(0)),
+            unexpected_data_conn_count,
             keepalive_pool_callback,
         }
     }
@@ -249,57 +251,31 @@ impl TransportConnector {
 
     /// Try to find a reusable connection to the given server [Peer]
     pub async fn reused_stream<P: Peer + Send + Sync>(&self, peer: &P) -> Option<Stream> {
-        match self.connection_pool.get(&peer.reuse_hash()) {
-            Some(s) => {
-                debug!("find reusable stream, trying to acquire it");
-                {
-                    let _ = s.lock().await;
-                } // wait for the idle poll to release it
-                match Arc::try_unwrap(s) {
-                    Ok(l) => {
-                        let mut stream = l.into_inner();
-                        // test_reusable_stream: we assume server would never actively send data
-                        // first on an idle stream.
-                        #[cfg(unix)]
-                        if peer.matches_fd(stream.id())
-                            && test_reusable_stream(&mut stream, &self.unexpected_data_conn_count)
-                        {
-                            Some(stream)
-                        } else {
-                            None
-                        }
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::io::{AsRawSocket, RawSocket};
-                            struct WrappedRawSocket(RawSocket);
-                            impl AsRawSocket for WrappedRawSocket {
-                                fn as_raw_socket(&self) -> RawSocket {
-                                    self.0
-                                }
-                            }
-                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
-                                && test_reusable_stream(
-                                    &mut stream,
-                                    &self.unexpected_data_conn_count,
-                                )
-                            {
-                                Some(stream)
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        error!("failed to acquire reusable stream");
-                        None
+        let stream = self.idle.take(peer.reuse_hash(), |stream| {
+            // test_reusable_stream: we assume server would never actively send data
+            // first on an idle stream.
+            #[cfg(unix)]
+            {
+                peer.matches_fd(stream.id())
+                    && test_reusable_stream(stream, &self.unexpected_data_conn_count)
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::{AsRawSocket, RawSocket};
+                struct WrappedRawSocket(RawSocket);
+                impl AsRawSocket for WrappedRawSocket {
+                    fn as_raw_socket(&self) -> RawSocket {
+                        self.0
                     }
                 }
+                peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+                    && test_reusable_stream(stream, &self.unexpected_data_conn_count)
             }
-            None => {
-                debug!("No reusable connection found for {peer}");
-                None
-            }
+        });
+        if stream.is_none() {
+            debug!("No reusable connection found for {peer}");
         }
+        stream
     }
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
@@ -318,32 +294,13 @@ impl TransportConnector {
         if !test_reusable_stream(&mut stream, &self.unexpected_data_conn_count) {
             return;
         }
-        let id = stream.id();
-        let meta = ConnectionMeta::new(key, id);
         debug!("Try to keepalive client session");
-        let stream = Arc::new(Mutex::new(stream));
-        let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
-        let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
-        let idle_meta = IdleConnection::new(meta);
-        let pool = self.connection_pool.clone(); //clone the arc
-        let keepalive_pool_callback = self.keepalive_pool_callback.clone();
-        let rt = pingora_runtime::current_handle();
-        rt.spawn(async move {
-            if pool
-                .idle_poll(
-                    locked_stream,
-                    &idle_meta.connection,
-                    idle_timeout,
-                    notify_close,
-                    watch_use,
-                )
-                .await
-            {
-                if let Some(callback) = keepalive_pool_callback {
-                    callback(idle_meta.elapsed());
-                }
-            }
-        });
+        self.idle.put(
+            key,
+            stream,
+            idle_timeout,
+            self.keepalive_pool_callback.as_ref(),
+        );
     }
 
     /// Get a stream to the given server [Peer]
