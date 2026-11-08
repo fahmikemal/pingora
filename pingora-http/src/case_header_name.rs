@@ -15,6 +15,7 @@
 use crate::*;
 use bytes::Bytes;
 use http::header;
+use http::header::InvalidHeaderName;
 
 #[derive(Debug, Clone)]
 pub struct CaseHeaderName(Bytes);
@@ -38,6 +39,81 @@ impl CaseHeaderName {
 /// A trait that converts into case-sensitive header names.
 pub trait IntoCaseHeaderName {
     fn into_case_header_name(self) -> CaseHeaderName;
+
+    /// The header name together with the case to write it in.
+    ///
+    /// By default the name is parsed out of [Self::into_case_header_name()]. Types that already
+    /// hold a parsed [HeaderName] return it instead, so inserting a header by such a name skips
+    /// parsing (and, for a name with upper case letters, a copy) every time.
+    fn into_header_name_and_case(self) -> Result<(HeaderName, CaseHeaderName), InvalidHeaderName>
+    where
+        Self: Sized,
+    {
+        let case = self.into_case_header_name();
+        let name = HeaderName::from_bytes(case.as_slice())?;
+        Ok((name, case))
+    }
+}
+
+/// A header name parsed once, together with the case it is written in on the wire.
+///
+/// Meant for names a proxy adds to every request or response, kept in a `static`:
+///
+/// ```
+/// use pingora_http::{CasedHeaderName, RequestHeader};
+///
+/// static X_FORWARDED_FOR: CasedHeaderName =
+///     CasedHeaderName::from_static("x-forwarded-for", "X-Forwarded-For");
+///
+/// let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+/// req.insert_header(&X_FORWARDED_FOR, "192.0.2.1").unwrap();
+/// assert_eq!(req.headers["x-forwarded-for"], "192.0.2.1");
+/// ```
+#[derive(Debug, Clone)]
+pub struct CasedHeaderName {
+    name: HeaderName,
+    case: CaseHeaderName,
+}
+
+impl CasedHeaderName {
+    /// `name` is the header name in lower case, as [HeaderName::from_static()] takes it, and
+    /// `case` the same name as written on the wire.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not a valid lower case header name, or `case` is not the same name. In a
+    /// `static` or `const` that is a compile error.
+    pub const fn from_static(name: &'static str, case: &'static str) -> Self {
+        let (a, b) = (name.as_bytes(), case.as_bytes());
+        assert!(a.len() == b.len(), "header name and its case differ");
+        let mut i = 0;
+        while i < a.len() {
+            assert!(
+                a[i] == b[i].to_ascii_lowercase(),
+                "header name and its case differ"
+            );
+            i += 1;
+        }
+        CasedHeaderName {
+            name: HeaderName::from_static(name),
+            case: CaseHeaderName(Bytes::from_static(b)),
+        }
+    }
+
+    /// The parsed header name.
+    pub fn name(&self) -> &HeaderName {
+        &self.name
+    }
+}
+
+impl IntoCaseHeaderName for &CasedHeaderName {
+    fn into_case_header_name(self) -> CaseHeaderName {
+        self.case.clone()
+    }
+
+    fn into_header_name_and_case(self) -> Result<(HeaderName, CaseHeaderName), InvalidHeaderName> {
+        Ok((self.name.clone(), self.case.clone()))
+    }
 }
 
 impl IntoCaseHeaderName for CaseHeaderName {
@@ -62,11 +138,20 @@ impl IntoCaseHeaderName for HeaderName {
     fn into_case_header_name(self) -> CaseHeaderName {
         CaseHeaderName(titled_header_name(&self))
     }
+
+    fn into_header_name_and_case(self) -> Result<(HeaderName, CaseHeaderName), InvalidHeaderName> {
+        let case = CaseHeaderName(titled_header_name(&self));
+        Ok((self, case))
+    }
 }
 
 impl IntoCaseHeaderName for &HeaderName {
     fn into_case_header_name(self) -> CaseHeaderName {
         CaseHeaderName(titled_header_name(self))
+    }
+
+    fn into_header_name_and_case(self) -> Result<(HeaderName, CaseHeaderName), InvalidHeaderName> {
+        Ok((self.clone(), CaseHeaderName(titled_header_name(self))))
     }
 }
 
@@ -108,6 +193,58 @@ pub(crate) fn titled_header_name_str(header_name: &HeaderName) -> Option<&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_name_and_case_agree_for_every_kind_of_name() {
+        static FORWARDED: CasedHeaderName =
+            CasedHeaderName::from_static("x-forwarded-for", "X-Forwarded-For");
+        let cases: [(Result<(HeaderName, CaseHeaderName), _>, &str, &[u8]); 7] = [
+            ("X-Foo".into_header_name_and_case(), "x-foo", b"X-Foo"),
+            (
+                "X-Foo".to_string().into_header_name_and_case(),
+                "x-foo",
+                b"X-Foo",
+            ),
+            (
+                Bytes::from_static(b"x-FOO").into_header_name_and_case(),
+                "x-foo",
+                b"x-FOO",
+            ),
+            (
+                header::SERVER.into_header_name_and_case(),
+                "server",
+                b"Server",
+            ),
+            (
+                (&header::ACCEPT).into_header_name_and_case(),
+                "accept",
+                b"accept",
+            ),
+            (
+                HeaderName::from_static("x-bar").into_header_name_and_case(),
+                "x-bar",
+                b"x-bar",
+            ),
+            (
+                (&FORWARDED).into_header_name_and_case(),
+                "x-forwarded-for",
+                b"X-Forwarded-For",
+            ),
+        ];
+        for (got, name, case) in cases {
+            let (got_name, got_case) = got.unwrap();
+            assert_eq!(got_name, name);
+            assert_eq!(got_case.as_slice(), case);
+        }
+        assert!("bad name".into_header_name_and_case().is_err());
+        assert_eq!(FORWARDED.name(), "x-forwarded-for");
+    }
+
+    #[test]
+    #[should_panic(expected = "header name and its case differ")]
+    fn cased_header_name_rejects_a_different_name() {
+        CasedHeaderName::from_static("x-forwarded-for", "X-Forwarded-Host");
+    }
 
     #[test]
     fn test_case_header_name() {
