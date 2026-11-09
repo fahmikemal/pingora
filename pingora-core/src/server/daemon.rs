@@ -20,6 +20,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -74,8 +75,38 @@ const DEFAULT_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to sleep between `SIGUSR1` send attempts when `EPERM` is returned.
 const NOTIFY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long to sleep between pid-file liveness checks in the async wait loop.
+/// How long to sleep between pid-file liveness checks in the wait loop.
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the parent's wait loop looks at [`READY`].
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Set by the parent's `SIGUSR1` handler when the daemon signals readiness.
+static READY: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_ready_signal(_: libc::c_int) {
+    // Only an atomic store: async-signal-safe.
+    READY.store(true, Ordering::SeqCst);
+}
+
+/// Set the disposition of `SIGUSR1` to `handler` (a function or `SIG_DFL`).
+fn set_sigusr1(handler: libc::sighandler_t) {
+    // SAFETY: the sigaction struct is zeroed, its mask emptied, and the handler is either
+    // `SIG_DFL` or `on_ready_signal`, which only stores to an atomic.
+    let ret = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut())
+    };
+    if ret != 0 {
+        error!(
+            "sigaction(SIGUSR1) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
 
 // XXX: this operation should have been done when the old service is exiting.
 // Now the new pid file just kick the old one out of the way
@@ -208,12 +239,22 @@ pub fn daemonize(conf: &ServerConf) -> DaemonizeResult {
 
     move_old_pid(&conf.pid_file);
 
+    if conf.daemon_wait_for_ready {
+        // Before forking: the daemon can finish its bootstrap and send SIGUSR1 before the
+        // parent reaches its wait loop, and SIGUSR1's default action terminates the parent.
+        set_sigusr1(on_ready_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+
     match build_daemonize(conf).execute() {
         Outcome::Parent(result) => {
             result.unwrap_or_else(|e| panic!("Daemonize failed: {e}"));
         }
         Outcome::Child(result) => {
             result.unwrap_or_else(|e| panic!("Daemonize child setup failed: {e}"));
+            if conf.daemon_wait_for_ready {
+                // The daemon inherited the parent's handler; give it the default back.
+                set_sigusr1(libc::SIG_DFL);
+            }
             return DaemonizeResult {
                 notify_parent_pid: parent_pid,
             };
@@ -247,72 +288,48 @@ pub fn daemonize(conf: &ServerConf) -> DaemonizeResult {
     process::exit(0);
 }
 
-/// Build a single-threaded tokio runtime for the parent's signal wait loop.
-///
-/// The parent process is short-lived and only needs to wait for a signal and check the pid file.
-/// A current-thread runtime avoids spawning worker threads in a process that is about to exit.
-fn build_parent_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime for parent signal wait")
-}
-
 /// Wait for the daemon grandchild to send `SIGUSR1`, up to `timeout`.
 ///
-/// Uses a local tokio runtime with [`tokio::signal::unix`] to listen for `SIGUSR1` instead of
-/// raw signal handlers and polling loops. The daemon's PID is checked periodically via the pid
-/// file — if the process exits before signaling, the parent aborts.
+/// The handler installed before forking sets [`READY`]; this loop polls it, and checks the
+/// daemon's PID from the pid file periodically — if the process exits before signaling, the
+/// parent aborts. A signal that arrived before this function was called is not lost.
 ///
 /// Exits the process directly:
 /// - exit code 0 if `SIGUSR1` is received (daemon is ready).
 /// - exit code 1 if `timeout` elapses (daemon took too long).
 /// - exit code 1 if the pid file exists and the process is no longer running.
 fn wait_for_ready_or_exit(pid_file: &str, timeout: Duration) {
-    let rt = build_parent_runtime();
-    let pid_file = pid_file.to_owned();
-
-    rt.block_on(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        use tokio::time::{interval, timeout as tokio_timeout};
-
-        let mut sigusr1 =
-            signal(SignalKind::user_defined1()).expect("failed to register SIGUSR1 listener");
-
-        let mut liveness_check = interval(LIVENESS_CHECK_INTERVAL);
-        let mut daemon_pid: Option<libc::pid_t> = None;
-
-        let result = tokio_timeout(timeout, async {
-            loop {
-                tokio::select! {
-                    _ = sigusr1.recv() => {
-                        info!("Daemon signaled readiness, parent exiting");
-                        return;
-                    }
-                    _ = liveness_check.tick() => {
-                        if daemon_pid.is_none() {
-                            daemon_pid = try_read_pid_file(&pid_file);
-                        }
-                        if let Some(pid) = daemon_pid {
-                            if !process_is_running(pid) {
-                                error!(
-                                    "Daemon process (pid {pid}) is no longer running \
-                                     before signaling readiness, aborting"
-                                );
-                                process::exit(1);
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await;
-
-        if result.is_err() {
+    let start = Instant::now();
+    let mut next_liveness_check = start;
+    let mut daemon_pid: Option<libc::pid_t> = None;
+    loop {
+        if READY.load(Ordering::SeqCst) {
+            info!("Daemon signaled readiness, parent exiting");
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(start) >= timeout {
             error!("Daemon did not signal readiness within {timeout:?}, aborting");
             process::exit(1);
         }
-    });
+        if now >= next_liveness_check {
+            next_liveness_check = now + LIVENESS_CHECK_INTERVAL;
+            if daemon_pid.is_none() {
+                daemon_pid = try_read_pid_file(pid_file);
+            }
+            if let Some(pid) = daemon_pid {
+                // A daemon that signaled and then exited still counts as ready.
+                if !process_is_running(pid) && !READY.load(Ordering::SeqCst) {
+                    error!(
+                        "Daemon process (pid {pid}) is no longer running \
+                         before signaling readiness, aborting"
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+        thread::sleep(READY_POLL_INTERVAL);
+    }
 }
 
 /// Notify the parent process that the daemon is ready to serve traffic by sending `SIGUSR1`.
@@ -442,5 +459,25 @@ fn build_daemonize(conf: &ServerConf) -> Daemonize<()> {
     match conf.group.as_ref() {
         Some(group) => daemonize.group(group.as_str()),
         None => daemonize,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_signal_before_the_wait_is_kept() {
+        // The daemon can signal before the parent starts waiting. With the handler installed
+        // beforehand, the signal neither terminates the process nor gets lost.
+        READY.store(false, Ordering::SeqCst);
+        set_sigusr1(on_ready_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        // SAFETY: raise(3) with a valid signal number; the handler only stores to an atomic.
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+        let start = Instant::now();
+        wait_for_ready_or_exit("/nonexistent/pingora-test.pid", Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        set_sigusr1(libc::SIG_DFL);
+        READY.store(false, Ordering::SeqCst);
     }
 }
