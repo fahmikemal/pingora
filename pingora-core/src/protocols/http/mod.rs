@@ -33,6 +33,27 @@ pub use server::{ReusableHttpStream, Session as ServerSession};
 /// The Pingora server name string
 pub const SERVER_NAME: &[u8; 7] = b"Pingora";
 
+static SERVER_HEADER: std::sync::RwLock<Option<http::HeaderValue>> =
+    std::sync::RwLock::new(Some(http::HeaderValue::from_static("Pingora")));
+
+/// Set the `Server` header of the responses Pingora writes on its own, such as the 400 for
+/// a request header that cannot be parsed; `None` leaves the header out. Default: `Pingora`.
+///
+/// Responses that already went out keep what they had. Applies to the whole process.
+pub fn set_server_header(value: Option<http::HeaderValue>) {
+    *SERVER_HEADER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
+/// The `Server` header Pingora's own responses carry, see [set_server_header].
+pub fn server_header() -> Option<http::HeaderValue> {
+    SERVER_HEADER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// An enum to hold all possible HTTP response events.
 #[derive(Debug)]
 pub enum HttpTask {

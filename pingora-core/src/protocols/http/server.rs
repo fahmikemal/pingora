@@ -593,12 +593,8 @@ impl Session {
     }
 
     pub fn generate_error(error: u16) -> ResponseHeader {
-        match error {
-            /* common error responses are pre-generated */
-            502 => error_resp::HTTP_502_RESPONSE.clone(),
-            400 => error_resp::HTTP_400_RESPONSE.clone(),
-            _ => error_resp::gen_error_response(error),
-        }
+        // Built each time: the `Server` header may have changed since (`set_server_header`).
+        error_resp::gen_error_response(error)
     }
 
     /// Send error response to client using a pre-generated error message.

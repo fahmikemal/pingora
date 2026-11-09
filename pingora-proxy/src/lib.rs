@@ -65,12 +65,12 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
+use pingora_core::protocols::http::server_header;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
-use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
 use pingora_core::server::configuration::ServerConf;
@@ -1131,16 +1131,17 @@ impl DerefMut for Session {
 }
 
 // generic HTTP 502 response sent when proxy_upstream_filter refuses to connect to upstream
-static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
+fn bad_gateway() -> ResponseHeader {
     let mut resp = ResponseHeader::build(http::StatusCode::BAD_GATEWAY, Some(3)).unwrap();
-    resp.insert_header(header::SERVER, &SERVER_NAME[..])
-        .unwrap();
+    if let Some(server) = server_header() {
+        resp.insert_header(header::SERVER, server).unwrap();
+    }
     resp.insert_header(header::CONTENT_LENGTH, 0).unwrap();
     resp.insert_header(header::CACHE_CONTROL, "private, no-store")
         .unwrap();
 
     resp
-});
+}
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -1238,7 +1239,10 @@ where
                         session.cache.disable(NoCacheReason::DeclinedToUpstream);
                     }
                     if session.response_written().is_none() {
-                        match session.write_response_header_ref(&BAD_GATEWAY, true).await {
+                        match session
+                            .write_response_header(Box::new(bad_gateway()), true)
+                            .await
+                        {
                             Ok(()) => {}
                             Err(e) => {
                                 return self

@@ -32,33 +32,29 @@ pub enum PurgeStatus {
 
 // Return a canned response to a purge request, based on whether the cache had the asset or not
 // (or otherwise returned an error).
+// Built each time: the `Server` header may have changed since (`set_server_header`).
 fn purge_response(purge_status: &PurgeStatus) -> Cow<'static, ResponseHeader> {
     let resp = match purge_status {
-        PurgeStatus::NoCache => &*NOT_PURGEABLE,
-        PurgeStatus::Found => &*OK,
-        PurgeStatus::NotFound => &*NOT_FOUND,
-        PurgeStatus::Error(ref _e) => &*INTERNAL_ERROR,
+        PurgeStatus::NoCache => gen_purge_response(405), // uncacheable asset
+        PurgeStatus::Found => gen_purge_response(200),
+        PurgeStatus::NotFound => gen_purge_response(404),
+        // on cache storage or proxy error
+        PurgeStatus::Error(ref _e) => error_resp::gen_error_response(500),
     };
-    Cow::Borrowed(resp)
+    Cow::Owned(resp)
 }
 
 fn gen_purge_response(code: u16) -> ResponseHeader {
     let mut resp = ResponseHeader::build(code, Some(3)).unwrap();
-    resp.insert_header(header::SERVER, &SERVER_NAME[..])
-        .unwrap();
+    if let Some(server) = server_header() {
+        resp.insert_header(header::SERVER, server).unwrap();
+    }
     resp.insert_header(header::CONTENT_LENGTH, 0).unwrap();
     resp.insert_header(header::CACHE_CONTROL, "private, no-store")
         .unwrap();
     // TODO more headers?
     resp
 }
-
-static OK: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(200));
-static NOT_FOUND: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(404));
-// for when purge is sent to uncacheable assets
-static NOT_PURGEABLE: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(405));
-// on cache storage or proxy error
-static INTERNAL_ERROR: Lazy<ResponseHeader> = Lazy::new(|| error_resp::gen_error_response(500));
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -109,7 +105,7 @@ where
                 "Failed purge response filter: {e}, {}",
                 self.inner.request_summary(session, ctx)
             );
-            purge_resp = Cow::Borrowed(&*INTERNAL_ERROR)
+            purge_resp = Cow::Owned(error_resp::gen_error_response(500))
         }
 
         let write_result = match purge_resp {
